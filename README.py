@@ -6,6 +6,15 @@ URL = "https://gss.bmwgroup.net/board/14324/meetings"
 DOWNLOAD_DIR = os.path.join(os.path.expanduser("~"), "Downloads")
 os.makedirs(DOWNLOAD_DIR, exist_ok=True)
 
+NEXT_BTN_XPATH = (
+    "xpath=/html/body/gss-app-root/div/div/div[2]/div/div[2]/gss-board-meetings/div[1]/div[1]/div/"
+    "gss-shared-calendar/div/div[4]/gss-half-year-view/div/div[1]/div[1]/div/p-button[2]//button"
+)
+PREV_BTN_XPATH = (
+    "xpath=/html/body/gss-app-root/div/div/div[2]/div/div[2]/gss-board-meetings/div[1]/div[1]/div/"
+    "gss-shared-calendar/div/div[4]/gss-half-year-view/div/div[1]/div[1]/div/p-button[1]//button"
+)
+
 
 def click_safe(page, selector, timeout=10000):
     sel = selector.strip()
@@ -21,10 +30,7 @@ def click_safe(page, selector, timeout=10000):
 
 
 def go_back_to_january_2021(page, max_clicks=80):
-    prev_btn = page.locator(
-        "xpath=/html/body/gss-app-root/div/div/div[2]/div/div[2]/gss-board-meetings/div[1]/div[1]/div/"
-        "gss-shared-calendar/div/div[4]/gss-half-year-view/div/div[1]/div[1]/div/p-button[1]//button"
-    )
+    prev_btn = page.locator(PREV_BTN_XPATH)
     prev_btn.wait_for(state="visible", timeout=60000)
 
     for _ in range(max_clicks):
@@ -44,7 +50,20 @@ def go_back_to_january_2021(page, max_clicks=80):
     raise RuntimeError("Januar 2021 nicht gefunden.")
 
 
-def download_meeting(page, meetings_url):
+def click_next_month(page):
+    """Einen Monat vorwärts im Kalender."""
+    next_btn = page.locator(NEXT_BTN_XPATH)
+    next_btn.wait_for(state="visible", timeout=10000)
+    try:
+        next_btn.click(timeout=8000)
+    except Exception:
+        next_btn.click(timeout=8000, force=True)
+    page.wait_for_load_state("domcontentloaded")
+    page.wait_for_timeout(800)
+    print("📅 Einen Monat vorwärts gesprungen.")
+
+
+def download_meeting(page):
     agenda_selector = (
         "xpath=/html/body/gss-app-root/div/div/div[2]/div/div[2]/gss-meeting-agenda"
         "/div/div[1]/div/div[2]/gss-meeting-documents-menu/div/p-button/button/span"
@@ -85,22 +104,16 @@ def download_meeting(page, meetings_url):
     )
     page.wait_for_timeout(2000)
 
-    # Schritt 4: ZIP per JavaScript im Browser herunterladen
-    # So wie es der normale Chrome macht — direkt als <a download> Link
-    print("📥 Starte Download über Browser-JavaScript...")
+    # Schritt 4: ZIP herunterladen
+    print("📥 Starte Download...")
     try:
         with page.expect_download(timeout=60000) as download_info:
-            # Klick auf Bestätigungs-Button
             click_safe(page, "/html/body/div/div/div[4]/p-button[2]/button")
-
-            # Gleichzeitig: falls es ein Blob ist, fangen wir es per JS ab
-            # und triggern einen echten <a download> Link
             page.evaluate("""
                 () => {
                     const origCreate = URL.createObjectURL;
                     URL.createObjectURL = function(blob) {
                         const url = origCreate.call(URL, blob);
-                        // Sofort einen Download-Link erzeugen und klicken
                         const a = document.createElement('a');
                         a.href = url;
                         a.download = 'meeting.zip';
@@ -115,13 +128,12 @@ def download_meeting(page, meetings_url):
 
         download = download_info.value
 
-        # Warten bis Download vollständig
+        # Warten bis Datei fertig
         path = download.path()
         while path is None:
             page.wait_for_timeout(500)
             path = download.path()
 
-        # Sauberer Dateiname mit Zeitstempel
         filename = download.suggested_filename or ""
         if not filename or not filename.endswith(".zip"):
             filename = f"meeting_{datetime.now().strftime('%Y%m%d_%H%M%S')}.zip"
@@ -129,17 +141,15 @@ def download_meeting(page, meetings_url):
         save_path = os.path.join(DOWNLOAD_DIR, filename)
         download.save_as(save_path)
 
-        # ZIP-Validierung
         with open(save_path, "rb") as f:
             magic = f.read(2)
 
         if magic == b"PK":
             print(f"✅ Gültige ZIP gespeichert: {save_path}")
-            return True
         else:
-            print(f"⚠️ Datei ist kein ZIP (Magic: {magic.hex()}) — Inhalt prüfen!")
-            # Trotzdem behalten
-            return True
+            print(f"⚠️ Datei gespeichert aber kein ZIP-Format (Magic: {magic.hex()})")
+
+        return True
 
     except Exception as e:
         print(f"❌ Download fehlgeschlagen: {e}")
@@ -158,19 +168,13 @@ with sync_playwright() as p:
             "--no-sandbox",
             "--disable-infobars",
             "--start-maximized",
-            # Downloads direkt in den Ordner ohne Dialog
             f"--download-default-directory={DOWNLOAD_DIR}",
         ],
         ignore_default_args=["--enable-automation"],
-        # Chrome-Einstellungen: Download-Dialog deaktivieren
-        # und Zielordner direkt setzen
     )
 
-    # Download-Verhalten per CDP setzen — kein Dialog, direkt speichern
-    ctx.grant_permissions([])
     page = ctx.new_page()
 
-    # CDP: Download-Verhalten auf "allow" setzen mit Zielordner
     client = page.context.new_cdp_session(page)
     client.send("Browser.setDownloadBehavior", {
         "behavior": "allow",
@@ -178,7 +182,6 @@ with sync_playwright() as p:
         "eventsEnabled": True,
     })
 
-    # Bot-Erkennung umgehen
     page.add_init_script("""
         Object.defineProperty(navigator, 'webdriver', { get: () => undefined });
         Object.defineProperty(navigator, 'plugins', { get: () => [1, 2, 3] });
@@ -191,27 +194,48 @@ with sync_playwright() as p:
     meetings_url = page.url
 
     print("\n>>> Klicke einen Meeting-Eintrag im Browser an.")
-    print(">>> Script erkennt deinen Klick und lädt die ZIP automatisch.")
+    print(">>> Nach jedem 2. Download springt der Kalender automatisch einen Monat vor.")
     print(">>> Browser schließen zum Beenden.\n")
+
+    download_count = 0
 
     while True:
         try:
-            result = download_meeting(page, meetings_url)
+            result = download_meeting(page)
 
             if result is None:
                 print("\n🛑 Browser geschlossen. Script beendet.")
                 break
-            elif result:
-                print("\n>>> Klicke den nächsten Meeting-Eintrag an...")
+
+            if result:
+                download_count += 1
+                print(f"📊 Downloads diese Session: {download_count}")
+
+                # Nach jedem 2. Download einen Monat vorwärts
+                if download_count % 2 == 0:
+                    print(f"⏭️  {download_count} Downloads — springe einen Monat vor...")
+                    try:
+                        page.goto(meetings_url, wait_until="domcontentloaded")
+                        page.wait_for_timeout(1000)
+                        click_next_month(page)
+                        meetings_url = page.url
+                    except Exception as e:
+                        print(f"⚠️ Monatswechsel fehlgeschlagen: {e}")
+                else:
+                    print("\n>>> Klicke den nächsten Meeting-Eintrag an...")
+                    try:
+                        page.goto(meetings_url, wait_until="domcontentloaded")
+                        page.wait_for_timeout(1500)
+                    except Exception:
+                        print("🛑 Konnte nicht zurücknavigieren.")
+                        break
             else:
                 print("\n⚠️ Übersprungen. Klicke den nächsten Eintrag an...")
-
-            try:
-                page.goto(meetings_url, wait_until="domcontentloaded")
-                page.wait_for_timeout(1500)
-            except Exception:
-                print("🛑 Konnte nicht zurücknavigieren.")
-                break
+                try:
+                    page.goto(meetings_url, wait_until="domcontentloaded")
+                    page.wait_for_timeout(1500)
+                except Exception:
+                    break
 
         except Exception as e:
             if "closed" in str(e).lower():
