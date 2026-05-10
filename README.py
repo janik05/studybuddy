@@ -85,83 +85,64 @@ def download_meeting(page, meetings_url):
     )
     page.wait_for_timeout(2000)
 
-    # Schritt 4: ZIP herunterladen
+    # Schritt 4: ZIP per JavaScript im Browser herunterladen
+    # So wie es der normale Chrome macht — direkt als <a download> Link
+    print("📥 Starte Download über Browser-JavaScript...")
     try:
         with page.expect_download(timeout=60000) as download_info:
+            # Klick auf Bestätigungs-Button
             click_safe(page, "/html/body/div/div/div[4]/p-button[2]/button")
+
+            # Gleichzeitig: falls es ein Blob ist, fangen wir es per JS ab
+            # und triggern einen echten <a download> Link
+            page.evaluate("""
+                () => {
+                    const origCreate = URL.createObjectURL;
+                    URL.createObjectURL = function(blob) {
+                        const url = origCreate.call(URL, blob);
+                        // Sofort einen Download-Link erzeugen und klicken
+                        const a = document.createElement('a');
+                        a.href = url;
+                        a.download = 'meeting.zip';
+                        document.body.appendChild(a);
+                        a.click();
+                        document.body.removeChild(a);
+                        URL.createObjectURL = origCreate;
+                        return url;
+                    };
+                }
+            """)
 
         download = download_info.value
 
-        # Dateiname bestimmen
+        # Warten bis Download vollständig
+        path = download.path()
+        while path is None:
+            page.wait_for_timeout(500)
+            path = download.path()
+
+        # Sauberer Dateiname mit Zeitstempel
         filename = download.suggested_filename or ""
-        if not filename.endswith(".zip"):
-            # Aus der Download-URL versuchen
-            url = download.url
-            name_from_url = url.split("/")[-1].split("?")[0]
-            if name_from_url.endswith(".zip"):
-                filename = name_from_url
-            else:
-                # Zeitstempel als eindeutiger Fallback
-                filename = f"meeting_{datetime.now().strftime('%Y%m%d_%H%M%S')}.zip"
+        if not filename or not filename.endswith(".zip"):
+            filename = f"meeting_{datetime.now().strftime('%Y%m%d_%H%M%S')}.zip"
 
         save_path = os.path.join(DOWNLOAD_DIR, filename)
         download.save_as(save_path)
 
-        # Prüfen ob echte ZIP (Magic Bytes PK = 50 4B)
+        # ZIP-Validierung
         with open(save_path, "rb") as f:
             magic = f.read(2)
 
         if magic == b"PK":
             print(f"✅ Gültige ZIP gespeichert: {save_path}")
+            return True
         else:
-            print(f"⚠️ Datei gespeichert, aber kein ZIP-Format!")
-            print(f"   Pfad: {save_path}")
-            print(f"   Magic Bytes: {magic.hex()} (erwartet: 504b)")
-            print(f"   Möglicherweise eine Fehlerseite — bitte manuell prüfen.")
-
-        return True
+            print(f"⚠️ Datei ist kein ZIP (Magic: {magic.hex()}) — Inhalt prüfen!")
+            # Trotzdem behalten
+            return True
 
     except Exception as e:
         print(f"❌ Download fehlgeschlagen: {e}")
-
-        # Fallback: fetch() im Browser-Kontext mit Cookies
-        print("🔄 Versuche Fallback via fetch()...")
-        captured = {"url": None}
-
-        def intercept(route):
-            url = route.request.url
-            if any(x in url for x in [".zip", "download", "export"]):
-                captured["url"] = url
-            route.continue_()
-
-        page.route("**/*", intercept)
-        try:
-            click_safe(page, "/html/body/div/div/div[4]/p-button[2]/button")
-            page.wait_for_timeout(5000)
-        except Exception:
-            pass
-        page.unroute("**/*")
-
-        if captured["url"]:
-            result = page.evaluate(
-                """async (url) => {
-                    const resp = await fetch(url, { credentials: 'include' });
-                    if (!resp.ok) return null;
-                    const blob = await resp.blob();
-                    const buf = await blob.arrayBuffer();
-                    return Array.from(new Uint8Array(buf));
-                }""",
-                captured["url"],
-            )
-            if result:
-                filename = f"meeting_{datetime.now().strftime('%Y%m%d_%H%M%S')}.zip"
-                save_path = os.path.join(DOWNLOAD_DIR, filename)
-                with open(save_path, "wb") as f:
-                    f.write(bytes(result))
-                print(f"✅ ZIP gespeichert (Fallback): {save_path}")
-                return True
-
-        print("❌ Kein Download möglich.")
         return False
 
 
@@ -177,11 +158,25 @@ with sync_playwright() as p:
             "--no-sandbox",
             "--disable-infobars",
             "--start-maximized",
+            # Downloads direkt in den Ordner ohne Dialog
+            f"--download-default-directory={DOWNLOAD_DIR}",
         ],
         ignore_default_args=["--enable-automation"],
+        # Chrome-Einstellungen: Download-Dialog deaktivieren
+        # und Zielordner direkt setzen
     )
 
+    # Download-Verhalten per CDP setzen — kein Dialog, direkt speichern
+    ctx.grant_permissions([])
     page = ctx.new_page()
+
+    # CDP: Download-Verhalten auf "allow" setzen mit Zielordner
+    client = page.context.new_cdp_session(page)
+    client.send("Browser.setDownloadBehavior", {
+        "behavior": "allow",
+        "downloadPath": DOWNLOAD_DIR,
+        "eventsEnabled": True,
+    })
 
     # Bot-Erkennung umgehen
     page.add_init_script("""
