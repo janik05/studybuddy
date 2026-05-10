@@ -98,30 +98,40 @@ def hole_protokoll_texte(page):
     return texte
 
 
-def download_fuer_eintrag(page, index):
+def hole_eintrag_koordinaten(page):
     """
-    Klickt den index-ten Protokoll-Eintrag an und führt den Download durch.
-    Gibt True/False/None zurück.
+    Liest die Mittelpunkt-Koordinaten aller Protokoll-Einträge aus.
+    Diese bleiben nach navigate_to_monat() stabil.
     """
     eintraege = page.locator(PROTOKOLL_SELEKTOR)
     count = eintraege.count()
+    koordinaten = []
+    for i in range(count):
+        try:
+            box = eintraege.nth(i).bounding_box()
+            if box:
+                koordinaten.append({
+                    "x": box["x"] + box["width"] / 2,
+                    "y": box["y"] + box["height"] / 2,
+                })
+        except Exception:
+            pass
+    print(f"📐 {len(koordinaten)} Koordinaten gespeichert.")
+    return koordinaten
 
-    if index >= count:
-        print(f"⚠️ Index {index} nicht mehr vorhanden (nur {count} Einträge).")
-        return False
 
-    eintrag = eintraege.nth(index)
-    print(f"🖱️  Klicke Eintrag {index + 1} von {count}...")
+def download_fuer_eintrag(page, koordinate, nummer, gesamt):
+    """
+    Klickt per Koordinate auf einen Protokoll-Eintrag und führt den Download durch.
+    Gibt True/False/None zurück.
+    """
+    print(f"🖱️  Doppelklick auf Eintrag {nummer} von {gesamt} (x={koordinate['x']:.0f}, y={koordinate['y']:.0f})...")
 
     try:
-        eintrag.scroll_into_view_if_needed(timeout=5000)
-        eintrag.click(timeout=8000)
-    except Exception:
-        try:
-            eintrag.click(timeout=8000, force=True)
-        except Exception as e:
-            print(f"❌ Klick fehlgeschlagen: {e}")
-            return False
+        page.mouse.dblclick(koordinate["x"], koordinate["y"])
+    except Exception as e:
+        print(f"❌ Doppelklick fehlgeschlagen: {e}")
+        return False
 
     # Warten bis Meeting-Detailansicht geladen
     agenda_selector = (
@@ -275,12 +285,15 @@ with sync_playwright() as p:
                 navigate_to_monat(page, basis_klicks - monat_offset)
                 continue
 
-            # Jeden Eintrag einzeln abarbeiten
-            # Nach jedem Download: zurück zum Monat, nächsten Index anklicken
-            for i in range(count):
+            # Koordinaten aller Einträge einmal speichern
+            koordinaten = hole_eintrag_koordinaten(page)
+            count = len(koordinaten)
+
+            # Jeden Eintrag per Koordinate anklicken
+            for i, koordinate in enumerate(koordinaten):
                 print(f"\n▶️  Verarbeite Eintrag {i + 1} von {count}...")
 
-                result = download_fuer_eintrag(page, i)
+                result = download_fuer_eintrag(page, koordinate, i + 1, count)
 
                 if result is None:
                     print("\n🛑 Browser geschlossen. Script beendet.")
