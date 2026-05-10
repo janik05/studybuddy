@@ -1,4 +1,5 @@
 from playwright.sync_api import sync_playwright
+from datetime import datetime
 import os
 
 URL = "https://gss.bmwgroup.net/board/14324/meetings"
@@ -84,26 +85,47 @@ def download_meeting(page, meetings_url):
     )
     page.wait_for_timeout(2000)
 
-    # Schritt 4: ZIP herunterladen — expect_download fängt auch Blob-Downloads ab
+    # Schritt 4: ZIP herunterladen
     try:
         with page.expect_download(timeout=60000) as download_info:
             click_safe(page, "/html/body/div/div/div[4]/p-button[2]/button")
 
         download = download_info.value
-        filename = download.suggested_filename or "meeting.zip"
+
+        # Dateiname bestimmen
+        filename = download.suggested_filename or ""
         if not filename.endswith(".zip"):
-            filename += ".zip"
+            # Aus der Download-URL versuchen
+            url = download.url
+            name_from_url = url.split("/")[-1].split("?")[0]
+            if name_from_url.endswith(".zip"):
+                filename = name_from_url
+            else:
+                # Zeitstempel als eindeutiger Fallback
+                filename = f"meeting_{datetime.now().strftime('%Y%m%d_%H%M%S')}.zip"
 
         save_path = os.path.join(DOWNLOAD_DIR, filename)
         download.save_as(save_path)
-        print(f"✅ ZIP gespeichert: {save_path}")
+
+        # Prüfen ob echte ZIP (Magic Bytes PK = 50 4B)
+        with open(save_path, "rb") as f:
+            magic = f.read(2)
+
+        if magic == b"PK":
+            print(f"✅ Gültige ZIP gespeichert: {save_path}")
+        else:
+            print(f"⚠️ Datei gespeichert, aber kein ZIP-Format!")
+            print(f"   Pfad: {save_path}")
+            print(f"   Magic Bytes: {magic.hex()} (erwartet: 504b)")
+            print(f"   Möglicherweise eine Fehlerseite — bitte manuell prüfen.")
+
         return True
 
     except Exception as e:
         print(f"❌ Download fehlgeschlagen: {e}")
 
-        # Fallback: fetch() im Browser-Kontext
-        print("🔄 Versuche Fallback...")
+        # Fallback: fetch() im Browser-Kontext mit Cookies
+        print("🔄 Versuche Fallback via fetch()...")
         captured = {"url": None}
 
         def intercept(route):
@@ -132,7 +154,8 @@ def download_meeting(page, meetings_url):
                 captured["url"],
             )
             if result:
-                save_path = os.path.join(DOWNLOAD_DIR, "meeting_fallback.zip")
+                filename = f"meeting_{datetime.now().strftime('%Y%m%d_%H%M%S')}.zip"
+                save_path = os.path.join(DOWNLOAD_DIR, filename)
                 with open(save_path, "wb") as f:
                     f.write(bytes(result))
                 print(f"✅ ZIP gespeichert (Fallback): {save_path}")
@@ -149,7 +172,6 @@ with sync_playwright() as p:
         headless=False,
         accept_downloads=True,
         downloads_path=DOWNLOAD_DIR,
-        # Unterdrückt "Chrome wird automatisiert gesteuert"-Banner
         args=[
             "--disable-blink-features=AutomationControlled",
             "--no-sandbox",
