@@ -6,10 +6,6 @@ URL = "https://gss.bmwgroup.net/board/14324/meetings"
 DOWNLOAD_DIR = os.path.join(os.path.expanduser("~"), "Downloads")
 os.makedirs(DOWNLOAD_DIR, exist_ok=True)
 
-NEXT_BTN_XPATH = (
-    "xpath=/html/body/gss-app-root/div/div/div[2]/div/div[2]/gss-board-meetings/div[1]/div[1]/div/"
-    "gss-shared-calendar/div/div[4]/gss-half-year-view/div/div[1]/div[1]/div/p-button[2]//button"
-)
 PREV_BTN_XPATH = (
     "xpath=/html/body/gss-app-root/div/div/div[2]/div/div[2]/gss-board-meetings/div[1]/div[1]/div/"
     "gss-shared-calendar/div/div[4]/gss-half-year-view/div/div[1]/div[1]/div/p-button[1]//button"
@@ -29,16 +25,40 @@ def click_safe(page, selector, timeout=10000):
         loc.click(timeout=timeout, force=True)
 
 
-def go_back_to_january_2021(page, max_clicks=80):
-    """Navigiert zurück bis Januar 2021."""
+def go_back_n_times(page, n):
+    """Drückt den Zurück-Button genau n mal."""
+    if n <= 0:
+        print("📅 Kein Zurücknavigieren nötig.")
+        return
+
     prev_btn = page.locator(PREV_BTN_XPATH)
     prev_btn.wait_for(state="visible", timeout=60000)
 
+    for i in range(n):
+        try:
+            prev_btn.click(timeout=8000)
+        except Exception:
+            prev_btn.click(timeout=8000, force=True)
+        page.wait_for_load_state("domcontentloaded")
+        page.wait_for_timeout(500)
+
+    print(f"📅 {n}x zurückgedrückt.")
+
+
+def go_back_to_january_2021_and_count(page, max_clicks=80):
+    """
+    Navigiert zurück bis Januar 2021 und gibt zurück
+    wie oft der Button gedrückt wurde.
+    """
+    prev_btn = page.locator(PREV_BTN_XPATH)
+    prev_btn.wait_for(state="visible", timeout=60000)
+
+    clicks = 0
     for _ in range(max_clicks):
         try:
             if page.locator("text=Januar 2021").first.is_visible(timeout=800):
-                print("✅ Januar 2021 erreicht.")
-                return
+                print(f"✅ Januar 2021 erreicht nach {clicks} Klicks.")
+                return clicks
         except Exception:
             pass
         try:
@@ -47,36 +67,16 @@ def go_back_to_january_2021(page, max_clicks=80):
             prev_btn.click(timeout=8000, force=True)
         page.wait_for_load_state("domcontentloaded")
         page.wait_for_timeout(500)
+        clicks += 1
 
     raise RuntimeError("Januar 2021 nicht gefunden.")
 
 
-def go_forward_months(page, months):
-    """Springt N Monate vorwärts vom aktuellen Kalenderstand."""
-    if months <= 0:
-        return
-    next_btn = page.locator(NEXT_BTN_XPATH)
-    next_btn.wait_for(state="visible", timeout=10000)
-    for i in range(months):
-        try:
-            next_btn.click(timeout=8000)
-        except Exception:
-            next_btn.click(timeout=8000, force=True)
-        page.wait_for_load_state("domcontentloaded")
-        page.wait_for_timeout(600)
-    print(f"📅 {months} Monat(e) vorgesprungen.")
-
-
-def navigate_to_month(page, target_month_offset):
-    """
-    Geht immer zuerst zu Januar 2021 zurück,
-    dann target_month_offset Monate vor.
-    """
+def navigate_back(page, clicks):
+    """Lädt die Seite neu und drückt clicks-mal zurück."""
     page.goto(URL, wait_until="domcontentloaded")
     page.wait_for_timeout(1000)
-    go_back_to_january_2021(page)
-    if target_month_offset > 0:
-        go_forward_months(page, target_month_offset)
+    go_back_n_times(page, clicks)
 
 
 def download_meeting(page):
@@ -199,12 +199,17 @@ with sync_playwright() as p:
         window.chrome = { runtime: {} };
     """)
 
-    # Starte bei Januar 2021
-    current_month_offset = 0  # 0 = Januar 2021
-    navigate_to_month(page, current_month_offset)
+    # Erster Start: zu Januar 2021 navigieren und Klicks zählen
+    page.goto(URL, wait_until="domcontentloaded")
+    page.wait_for_timeout(1000)
+    basis_klicks = go_back_to_january_2021_and_count(page)
+    # basis_klicks = wie oft zurückgedrückt wurde um Jan 2021 zu erreichen
+    # aktuelle_klicks = basis_klicks - (download_count // 8)
+    # => alle 8 Downloads einen Klick weniger = einen Monat weiter vor
 
-    print("\n>>> Klicke einen Meeting-Eintrag im Browser an.")
-    print(">>> Nach jedem 2. Download springt der Kalender automatisch einen Monat vor.")
+    print(f"\n📌 Basis: {basis_klicks} Klicks bis Januar 2021")
+    print(">>> Klicke einen Meeting-Eintrag im Browser an.")
+    print(">>> Alle 8 Downloads springt der Kalender einen Monat vor.")
     print(">>> Browser schließen zum Beenden.\n")
 
     download_count = 0
@@ -219,21 +224,18 @@ with sync_playwright() as p:
 
             if result:
                 download_count += 1
-                print(f"📊 Downloads: {download_count} | Aktueller Monat-Offset: +{current_month_offset} ab Jan 2021")
+                monate_vor = download_count // 8
+                aktuelle_klicks = basis_klicks - monate_vor
+                print(f"📊 Downloads: {download_count} | Monat-Offset: +{monate_vor} | Zurück-Klicks: {aktuelle_klicks}")
 
-                # Nach jedem 2. Download: einen Monat vor
-                if download_count % 2 == 0:
-                    current_month_offset += 1
-                    print(f"⏭️  Springe zu Monat +{current_month_offset} ab Januar 2021...")
-                    navigate_to_month(page, current_month_offset)
-                else:
-                    # Zurück zum gleichen Monat
-                    navigate_to_month(page, current_month_offset)
-                    print(">>> Klicke den nächsten Meeting-Eintrag an...")
+                navigate_back(page, aktuelle_klicks)
+                print(">>> Klicke den nächsten Meeting-Eintrag an...")
 
             else:
-                print("\n⚠️ Übersprungen — zurück zum gleichen Monat...")
-                navigate_to_month(page, current_month_offset)
+                print("\n⚠️ Übersprungen — navigiere zurück...")
+                monate_vor = download_count // 8
+                aktuelle_klicks = basis_klicks - monate_vor
+                navigate_back(page, aktuelle_klicks)
 
         except Exception as e:
             if "closed" in str(e).lower():
@@ -241,7 +243,9 @@ with sync_playwright() as p:
                 break
             print(f"\n❌ Fehler: {e}")
             try:
-                navigate_to_month(page, current_month_offset)
+                monate_vor = download_count // 8
+                aktuelle_klicks = basis_klicks - monate_vor
+                navigate_back(page, aktuelle_klicks)
             except Exception:
                 break
 
