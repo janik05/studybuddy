@@ -30,6 +30,7 @@ def click_safe(page, selector, timeout=10000):
 
 
 def go_back_to_january_2021(page, max_clicks=80):
+    """Navigiert zurück bis Januar 2021."""
     prev_btn = page.locator(PREV_BTN_XPATH)
     prev_btn.wait_for(state="visible", timeout=60000)
 
@@ -50,17 +51,32 @@ def go_back_to_january_2021(page, max_clicks=80):
     raise RuntimeError("Januar 2021 nicht gefunden.")
 
 
-def click_next_month(page):
-    """Einen Monat vorwärts im Kalender."""
+def go_forward_months(page, months):
+    """Springt N Monate vorwärts vom aktuellen Kalenderstand."""
+    if months <= 0:
+        return
     next_btn = page.locator(NEXT_BTN_XPATH)
     next_btn.wait_for(state="visible", timeout=10000)
-    try:
-        next_btn.click(timeout=8000)
-    except Exception:
-        next_btn.click(timeout=8000, force=True)
-    page.wait_for_load_state("domcontentloaded")
-    page.wait_for_timeout(800)
-    print("📅 Einen Monat vorwärts gesprungen.")
+    for i in range(months):
+        try:
+            next_btn.click(timeout=8000)
+        except Exception:
+            next_btn.click(timeout=8000, force=True)
+        page.wait_for_load_state("domcontentloaded")
+        page.wait_for_timeout(600)
+    print(f"📅 {months} Monat(e) vorgesprungen.")
+
+
+def navigate_to_month(page, target_month_offset):
+    """
+    Geht immer zuerst zu Januar 2021 zurück,
+    dann target_month_offset Monate vor.
+    """
+    page.goto(URL, wait_until="domcontentloaded")
+    page.wait_for_timeout(1000)
+    go_back_to_january_2021(page)
+    if target_month_offset > 0:
+        go_forward_months(page, target_month_offset)
 
 
 def download_meeting(page):
@@ -80,7 +96,6 @@ def download_meeting(page):
     print("✅ Meeting erkannt — starte Download-Flow...")
     page.wait_for_timeout(1000)
 
-    # Schritt 1: Dokument-Menü öffnen
     click_safe(
         page,
         "/html/body/gss-app-root/div/div/div[2]/div/div[2]/gss-meeting-agenda"
@@ -88,7 +103,6 @@ def download_meeting(page):
     )
     page.wait_for_timeout(2000)
 
-    # Schritt 2: Menüpunkt 9 wählen
     click_safe(
         page,
         "/html/body/gss-app-root/div/div/div[2]/div/div[2]/gss-meeting-agenda"
@@ -96,7 +110,6 @@ def download_meeting(page):
     )
     page.wait_for_timeout(2000)
 
-    # Schritt 3: Download-Button
     click_safe(
         page,
         "/html/body/gss-app-root/div/div/div[2]/div/div[2]/gss-meeting-documents-map"
@@ -104,7 +117,6 @@ def download_meeting(page):
     )
     page.wait_for_timeout(2000)
 
-    # Schritt 4: ZIP herunterladen
     print("📥 Starte Download...")
     try:
         with page.expect_download(timeout=60000) as download_info:
@@ -128,7 +140,6 @@ def download_meeting(page):
 
         download = download_info.value
 
-        # Warten bis Datei fertig
         path = download.path()
         while path is None:
             page.wait_for_timeout(500)
@@ -188,10 +199,9 @@ with sync_playwright() as p:
         window.chrome = { runtime: {} };
     """)
 
-    page.goto(URL, wait_until="domcontentloaded")
-
-    go_back_to_january_2021(page)
-    meetings_url = page.url
+    # Starte bei Januar 2021
+    current_month_offset = 0  # 0 = Januar 2021
+    navigate_to_month(page, current_month_offset)
 
     print("\n>>> Klicke einen Meeting-Eintrag im Browser an.")
     print(">>> Nach jedem 2. Download springt der Kalender automatisch einen Monat vor.")
@@ -209,33 +219,21 @@ with sync_playwright() as p:
 
             if result:
                 download_count += 1
-                print(f"📊 Downloads diese Session: {download_count}")
+                print(f"📊 Downloads: {download_count} | Aktueller Monat-Offset: +{current_month_offset} ab Jan 2021")
 
-                # Nach jedem 2. Download einen Monat vorwärts
+                # Nach jedem 2. Download: einen Monat vor
                 if download_count % 2 == 0:
-                    print(f"⏭️  {download_count} Downloads — springe einen Monat vor...")
-                    try:
-                        page.goto(meetings_url, wait_until="domcontentloaded")
-                        page.wait_for_timeout(1000)
-                        click_next_month(page)
-                        meetings_url = page.url
-                    except Exception as e:
-                        print(f"⚠️ Monatswechsel fehlgeschlagen: {e}")
+                    current_month_offset += 1
+                    print(f"⏭️  Springe zu Monat +{current_month_offset} ab Januar 2021...")
+                    navigate_to_month(page, current_month_offset)
                 else:
-                    print("\n>>> Klicke den nächsten Meeting-Eintrag an...")
-                    try:
-                        page.goto(meetings_url, wait_until="domcontentloaded")
-                        page.wait_for_timeout(1500)
-                    except Exception:
-                        print("🛑 Konnte nicht zurücknavigieren.")
-                        break
+                    # Zurück zum gleichen Monat
+                    navigate_to_month(page, current_month_offset)
+                    print(">>> Klicke den nächsten Meeting-Eintrag an...")
+
             else:
-                print("\n⚠️ Übersprungen. Klicke den nächsten Eintrag an...")
-                try:
-                    page.goto(meetings_url, wait_until="domcontentloaded")
-                    page.wait_for_timeout(1500)
-                except Exception:
-                    break
+                print("\n⚠️ Übersprungen — zurück zum gleichen Monat...")
+                navigate_to_month(page, current_month_offset)
 
         except Exception as e:
             if "closed" in str(e).lower():
@@ -243,8 +241,7 @@ with sync_playwright() as p:
                 break
             print(f"\n❌ Fehler: {e}")
             try:
-                page.goto(meetings_url, wait_until="domcontentloaded")
-                page.wait_for_timeout(1000)
+                navigate_to_month(page, current_month_offset)
             except Exception:
                 break
 
