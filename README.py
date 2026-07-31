@@ -501,6 +501,37 @@ def _find_datalinks_dialog_rect():
     return res[0] if res else None
 
 
+def _find_datalinks_dialog_hwnd():
+    """Handle des think-cell-Dialogs 'Datenverknuepfungen'."""
+    import win32gui
+    res = []
+
+    def cb(h, _):
+        try:
+            if (win32gui.IsWindowVisible(h)
+                    and win32gui.GetWindowText(h) == "Datenverkn\u00fcpfungen"
+                    and win32gui.GetClassName(h).startswith("ATL:")):
+                res.append(h)
+        except Exception:
+            pass
+
+    win32gui.EnumWindows(cb, None)
+    return res[0] if res else None
+
+
+def _get_dpi_scale(hwnd) -> float:
+    """DPI-Skalierungsfaktor relativ zur Kalibrierung der Klick-Offsets (150 % = 144 DPI).
+    Faellt auf 1.0 zurueck, wenn GetDpiForWindow nicht verfuegbar ist (aeltere Windows-Version)."""
+    import ctypes
+    try:
+        dpi = ctypes.windll.user32.GetDpiForWindow(hwnd)
+        if dpi:
+            return dpi / 144.0
+    except Exception:
+        pass
+    return 1.0
+
+
 def _update_thinkcell_via_dialog(target_name: str) -> bool:
     """Bildet exakt den manuellen think-cell-Ablauf nach:
     Einfuegen-Tab -> 'Datenverknuepfungen...' oeffnen -> 'Alle verknuepften
@@ -508,11 +539,13 @@ def _update_thinkcell_via_dialog(target_name: str) -> bool:
 
     Oeffnen/Auswaehlen/Schliessen laufen ueber UIA (InvokePattern, funktioniert
     unabhaengig von Fokus/Monitor). Der Update-Button ist eigen-gezeichnet und
-    nicht UIA-ansprechbar -> Koordinaten-Klick relativ zum Dialog-Rechteck.
+    nicht UIA-ansprechbar -> Koordinaten-Klick relativ zum Dialog-Rechteck,
+    DPI-skaliert und mit explizitem Foreground-Fenster.
     """
     import time
     import win32api
     import win32con
+    import win32gui
 
     try:
         from pywinauto.application import Application
@@ -522,6 +555,7 @@ def _update_thinkcell_via_dialog(target_name: str) -> bool:
 
     # Offsets des Update-Buttons (Kreispfeil) vom Dialogrand, in LOGISCHEN Pixeln
     # (gemessen bei 150 %, DPI-unaware). Rechtsbuendige Mini-Toolbar, erste Quellzeile.
+    # Werden zur Laufzeit per _get_dpi_scale() an die tatsaechliche Skalierung angepasst.
     OFFSET_FROM_RIGHT = 69
     OFFSET_FROM_TOP = 176
 
@@ -562,9 +596,13 @@ def _update_thinkcell_via_dialog(target_name: str) -> bool:
         print("WARN: Datenverknuepfungen-Dialog ist nicht erschienen.")
         return False
 
+    dlg_hwnd = _find_datalinks_dialog_hwnd()
+    if dlg_hwnd is None:
+        print("WARN: Handle des Datenverknuepfungen-Dialogs nicht gefunden.")
+        return False
+
     # 3) 'Alle verknuepften Elemente auswaehlen' aufrufen (UIA).
     try:
-        dlg_hwnd = _find_datalinks_dialog_hwnd()
         dlg_app = Application(backend="uia").connect(handle=dlg_hwnd)
         dlg = dlg_app.window(handle=dlg_hwnd)
         dlg.child_window(title_re="Alle verkn.*", control_type="Button").wrapper_object().invoke()
@@ -573,11 +611,22 @@ def _update_thinkcell_via_dialog(target_name: str) -> bool:
         print(f"WARN: 'Alle verknuepften Elemente auswaehlen' fehlgeschlagen: {exc}")
         return False
 
-    # 4) Update-Button (Kreispfeil) per Koordinaten-Klick. Rect frisch lesen.
+    # 4) Dialog in den Vordergrund holen, damit der synthetische Klick auch ankommt
+    #    (ohne Fokus/Vordergrund verpuffen SetCursorPos/mouse_event oft wirkungslos).
+    try:
+        win32gui.SetForegroundWindow(dlg_hwnd)
+        time.sleep(0.3)
+    except Exception as exc:
+        print(f"Hinweis: Dialog konnte nicht in den Vordergrund geholt werden: {exc}")
+
+    # 5) Update-Button (Kreispfeil) per Koordinaten-Klick. Rect frisch lesen,
+    #    Offsets an die tatsaechliche DPI-Skalierung anpassen (Kalibrierung war 150 %).
     rect = _find_datalinks_dialog_rect() or rect
     left, top, right, bottom = rect
-    x = right - OFFSET_FROM_RIGHT
-    y = top + OFFSET_FROM_TOP
+    scale = _get_dpi_scale(dlg_hwnd)
+    x = right - int(OFFSET_FROM_RIGHT * scale)
+    y = top + int(OFFSET_FROM_TOP * scale)
+    print(f"DEBUG: dpi_scale={scale:.2f}, rect={rect}, click=({x},{y})")
     print(f"think-cell-Update: Klick auf Aktualisieren bei ({x},{y}) - Dialog {rect}.")
     try:
         win32api.SetCursorPos((x, y))
@@ -592,20 +641,19 @@ def _update_thinkcell_via_dialog(target_name: str) -> bool:
     # think-cell braucht einen Moment fuer die Aktualisierung.
     time.sleep(6)
 
-    # 5) Dialog schliessen (UIA).
+    # 6) Dialog schliessen (UIA).
     try:
         dlg.child_window(title="Schlie\u00dfen", control_type="Button").wrapper_object().invoke()
     except Exception:
         # Fallback: Fenster direkt schliessen.
         try:
-            import win32gui
             win32gui.PostMessage(dlg_hwnd, win32con.WM_CLOSE, 0, 0)
         except Exception:
             pass
 
     time.sleep(1)
 
-    # 6) Speichern.
+    # 7) Speichern.
     try:
         import pythoncom
         _app, pres = _get_presentation(target_name)
@@ -621,24 +669,6 @@ def _update_thinkcell_via_dialog(target_name: str) -> bool:
         print(f"WARN: Speichern nach Dialog-Update fehlgeschlagen: {exc}")
 
     return True
-
-
-def _find_datalinks_dialog_hwnd():
-    """Handle des think-cell-Dialogs 'Datenverknuepfungen'."""
-    import win32gui
-    res = []
-
-    def cb(h, _):
-        try:
-            if (win32gui.IsWindowVisible(h)
-                    and win32gui.GetWindowText(h) == "Datenverkn\u00fcpfungen"
-                    and win32gui.GetClassName(h).startswith("ATL:")):
-                res.append(h)
-        except Exception:
-            pass
-
-    win32gui.EnumWindows(cb, None)
-    return res[0] if res else None
 
 
 def _build_ppt_url(config: Dict[str, Any]) -> str:
