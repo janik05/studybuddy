@@ -532,6 +532,62 @@ def _get_dpi_scale(hwnd) -> float:
     return 1.0
 
 
+
+def _find_thinkcell_source_controls(dlg):
+    """Sucht im think-cell-Dialog nach allen sichtbaren Excel-/SharePoint-Quellen.
+
+    think-cell zeichnet den Aktualisieren-Button selbst. Die jeweilige Quellzeile
+    ist ueber UI Automation jedoch haeufig als Text-, Listen- oder Baumelement
+    sichtbar. Diese Funktion liefert pro erkannter Quelle genau ein Steuerelement
+    sowie dessen Beschriftung zurueck.
+    """
+    import re
+
+    source_pattern = re.compile(
+        r"(https?://|sharepoint|\\.xlsx\\b|\\.xlsm\\b|\\.xlsb\\b|\\.xls\\b)",
+        re.IGNORECASE,
+    )
+
+    candidates = []
+
+    try:
+        controls = dlg.descendants()
+    except Exception as exc:
+        print(f"WARN: think-cell-Dialog konnte nicht durchsucht werden: {exc}")
+        return []
+
+    for control in controls:
+        try:
+            text = (control.window_text() or "").strip()
+            rect = control.rectangle()
+            visible = control.is_visible()
+        except Exception:
+            continue
+
+        if not visible or not text or not source_pattern.search(text):
+            continue
+
+        if rect.width() <= 0 or rect.height() <= 0:
+            continue
+
+        row_y = int((rect.top + rect.bottom) / 2)
+        candidates.append((row_y, control, text))
+
+    # UIA kann denselben sichtbaren Text mehrfach als Eltern- und Kindelement
+    # melden. Deshalb werden Treffer in derselben Bildschirmzeile zusammengefasst.
+    candidates.sort(key=lambda item: item[0])
+    sources = []
+    used_rows = []
+
+    for row_y, control, text in candidates:
+        if any(abs(row_y - existing_y) <= 4 for existing_y in used_rows):
+            continue
+        used_rows.append(row_y)
+        sources.append((control, text))
+
+    return sources
+
+
 def _update_thinkcell_via_dialog(target_name: str) -> bool:
     """Bildet exakt den manuellen think-cell-Ablauf nach:
     Einfuegen-Tab -> 'Datenverknuepfungen...' oeffnen -> 'Alle verknuepften
@@ -619,27 +675,131 @@ def _update_thinkcell_via_dialog(target_name: str) -> bool:
     except Exception as exc:
         print(f"Hinweis: Dialog konnte nicht in den Vordergrund geholt werden: {exc}")
 
-    # 5) Update-Button (Kreispfeil) per Koordinaten-Klick. Rect frisch lesen,
-    #    Offsets an die tatsaechliche DPI-Skalierung anpassen (Kalibrierung war 150 %).
-    rect = _find_datalinks_dialog_rect() or rect
-    left, top, right, bottom = rect
-    scale = _get_dpi_scale(dlg_hwnd)
-    x = right - int(OFFSET_FROM_RIGHT * scale)
-    y = top + int(OFFSET_FROM_TOP * scale)
-    print(f"DEBUG: dpi_scale={scale:.2f}, rect={rect}, click=({x},{y})")
-    print(f"think-cell-Update: Klick auf Aktualisieren bei ({x},{y}) - Dialog {rect}.")
-    try:
-        win32api.SetCursorPos((x, y))
-        time.sleep(0.3)
-        win32api.mouse_event(win32con.MOUSEEVENTF_LEFTDOWN, 0, 0, 0, 0)
-        time.sleep(0.05)
-        win32api.mouse_event(win32con.MOUSEEVENTF_LEFTUP, 0, 0, 0, 0)
-    except Exception as exc:
-        print(f"WARN: Klick auf Update-Button fehlgeschlagen: {exc}")
-        return False
+    # 5) Alle vorhandenen think-cell-Datenquellen einzeln aktualisieren.
+    #
+    # Der fruehere Code klickte nur auf den Kreispfeil der ersten Quellzeile.
+    # Bei mehreren Excel- oder SharePoint-Quellen wurde dadurch nur diese eine
+    # Quelle aktualisiert. Nun wird jede erkannte Quellzeile nacheinander bedient.
+    source_controls = _find_thinkcell_source_controls(dlg)
 
-    # think-cell braucht einen Moment fuer die Aktualisierung.
-    time.sleep(6)
+    if source_controls:
+        print(f"think-cell: {len(source_controls)} Datenquelle(n) erkannt.")
+        updated_sources = 0
+
+        for number, (source_control, source_text) in enumerate(source_controls, start=1):
+            # Falls die Quelle ausserhalb des sichtbaren Bereichs liegt, versucht
+            # pywinauto, sie in den sichtbaren Dialogbereich zu scrollen.
+            try:
+                source_control.scroll_into_view()
+                time.sleep(0.5)
+            except Exception:
+                pass
+
+            try:
+                source_rect = source_control.rectangle()
+                row_y = int((source_rect.top + source_rect.bottom) / 2)
+            except Exception as exc:
+                print(
+                    f"WARN: Position der Datenquelle {number} konnte nicht "
+                    f"bestimmt werden: {exc}"
+                )
+                continue
+
+            # Das Dialogrechteck nach jedem Scrollvorgang erneut einlesen.
+            current_rect = _find_datalinks_dialog_rect() or rect
+            left, top, right, bottom = current_rect
+            scale = _get_dpi_scale(dlg_hwnd)
+
+            # Der Kreispfeil liegt rechts in derselben Zeile wie die Datenquelle.
+            click_x = right - int(OFFSET_FROM_RIGHT * scale)
+            click_y = row_y
+
+            # Sicherheitspruefung: Nur innerhalb des Dialogs klicken.
+            if not (left < click_x < right and top < click_y < bottom):
+                print(
+                    f"WARN: Datenquelle {number} liegt ausserhalb des sichtbaren "
+                    f"Dialogbereichs und wird uebersprungen: {source_text}"
+                )
+                continue
+
+            try:
+                win32gui.SetForegroundWindow(dlg_hwnd)
+                time.sleep(0.3)
+
+                print(
+                    f"think-cell-Update {number}/{len(source_controls)}: "
+                    f"{source_text}"
+                )
+                print(
+                    f"DEBUG: dpi_scale={scale:.2f}, rect={current_rect}, "
+                    f"click=({click_x},{click_y})"
+                )
+
+                win32api.SetCursorPos((click_x, click_y))
+                time.sleep(0.3)
+                win32api.mouse_event(
+                    win32con.MOUSEEVENTF_LEFTDOWN, 0, 0, 0, 0
+                )
+                time.sleep(0.05)
+                win32api.mouse_event(
+                    win32con.MOUSEEVENTF_LEFTUP, 0, 0, 0, 0
+                )
+
+                updated_sources += 1
+                time.sleep(6)
+
+            except Exception as exc:
+                print(
+                    f"WARN: Datenquelle {number} konnte nicht aktualisiert "
+                    f"werden: {exc}"
+                )
+
+        print(
+            f"think-cell: {updated_sources} von {len(source_controls)} "
+            f"Datenquelle(n) aktualisiert."
+        )
+
+        if updated_sources == 0:
+            print("WARN: Keine erkannte think-cell-Datenquelle wurde aktualisiert.")
+            return False
+
+    else:
+        # Fallback auf das bisherige Verhalten, falls think-cell die Quellzeilen
+        # in der verwendeten Version nicht ueber UI Automation bereitstellt.
+        current_rect = _find_datalinks_dialog_rect() or rect
+        left, top, right, bottom = current_rect
+        scale = _get_dpi_scale(dlg_hwnd)
+        click_x = right - int(OFFSET_FROM_RIGHT * scale)
+        click_y = top + int(OFFSET_FROM_TOP * scale)
+
+        print(
+            "WARN: Keine einzelnen think-cell-Datenquellen ueber UIA erkannt. "
+            "Fallback auf die erste Quellzeile."
+        )
+        print(
+            f"DEBUG: dpi_scale={scale:.2f}, rect={current_rect}, "
+            f"click=({click_x},{click_y})"
+        )
+
+        try:
+            win32gui.SetForegroundWindow(dlg_hwnd)
+            time.sleep(0.3)
+            win32api.SetCursorPos((click_x, click_y))
+            time.sleep(0.3)
+            win32api.mouse_event(
+                win32con.MOUSEEVENTF_LEFTDOWN, 0, 0, 0, 0
+            )
+            time.sleep(0.05)
+            win32api.mouse_event(
+                win32con.MOUSEEVENTF_LEFTUP, 0, 0, 0, 0
+            )
+            time.sleep(6)
+        except Exception as exc:
+            print(f"WARN: Fallback-Aktualisierung fehlgeschlagen: {exc}")
+            return False
+
+    # Kurze Zusatzwartezeit, bevor der Dialog geschlossen wird.
+    time.sleep(2)
 
     # 6) Dialog schliessen (UIA).
     try:
